@@ -7,9 +7,9 @@ import time
 # -------------------------
 # CONFIGURATION
 # -------------------------
-USERNAME = "jhomel.panit"
-PASSWORD = "Jp101199@"
-TIMESHEET_URL = "https://psa-fs.ent.cgi.com/psp/fsprda/?cmd=login&amp;amp;languageCd=ENG&amp;amp;"
+USERNAME = "" # input your credentials here
+PASSWORD = "" # input your credentials here
+TIMESHEET_URL = "" # input timesheet portal URL here
 # -------------------------
 
 def launch_edge():
@@ -300,3 +300,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
