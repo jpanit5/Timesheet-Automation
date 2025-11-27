@@ -2,302 +2,279 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+import smtplib
+import traceback
+import requests
 import time
+import re
 
-# -------------------------
-# CONFIGURATION
-# -------------------------
-USERNAME = "" # input your credentials here
-PASSWORD = "" # input your credentials here
-TIMESHEET_URL = "" # input timesheet portal URL here
-# -------------------------
 
-def launch_edge():
-    """Launches Edge browser."""
-    options = webdriver.EdgeOptions()
-    options.add_argument("--start-maximized")
-    driver = webdriver.Edge(options=options)
-    return driver
+class TimesheetBot:
+    def __init__(self):
+        # Email
+        self.SENDER_EMAIL = "Input sender email"
+        self.SENDER_PASSWORD = "Input generated password"
+        self.RECEIVER_EMAIL = "Input receiver email"
+        self.SMTP_SERVER = "smtp.gmail.com"
+        self.SMTP_PORT = 587
 
-def login(driver):
-    print("Navigating to timesheet portal...")
-    driver.get(TIMESHEET_URL)
+        # PSA credentials
+        self.USERNAME = "input username"
+        self.PASSWORD = "input password"
+        self.TIMESHEET_URL = "URL for the timesheet(PSA)"
 
-    wait = WebDriverWait(driver, 20)
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-    print("Page loaded.")
+        # Cache
+        self.HOLIDAYS_CACHE = {}
+        self.PUBLIC_HOLIDAY_ROW_INDEX = 16
 
-    try:
-        username_input = wait.until(EC.presence_of_element_located((By.ID, "userid")))
-        password_input = wait.until(EC.presence_of_element_located((By.ID, "pwd")))
-        print("Found login fields.")
+        # Driver
+        self.driver = None
 
-        username_input.clear()
-        username_input.send_keys(USERNAME)
-        password_input.clear()
-        password_input.send_keys(PASSWORD)
+    # Browser / Login
+    def launch_edge(self):
+        options = webdriver.EdgeOptions()
+        options.add_argument("--start-maximized")
+        self.driver = webdriver.Edge(options=options)
+        print("Launched Edge browser")
 
-        sign_in_button = wait.until(EC.element_to_be_clickable((By.NAME, "Submit")))
-        sign_in_button.click()
-        print("Credentials entered and login submitted.")
-    except Exception as e:
-        print(f"Login failed: {e}")
+    def login(self):
+        driver = self.driver
+        print("Navigating to timesheet portal...")
+        driver.get(self.TIMESHEET_URL)
+        wait = WebDriverWait(driver, 20)
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
 
-def click_my_time_reports(driver):
-    print("Looking for 'My Time Reports'...")
-    wait = WebDriverWait(driver, 15)
-    try:
+        try:
+            username_input = wait.until(EC.presence_of_element_located((By.ID, "userid")))
+            password_input = wait.until(EC.presence_of_element_located((By.ID, "pwd")))
+            username_input.clear()
+            username_input.send_keys(self.USERNAME)
+            password_input.clear()
+            password_input.send_keys(self.PASSWORD)
+            sign_in_button = wait.until(EC.element_to_be_clickable((By.NAME, "Submit")))
+            sign_in_button.click()
+            print("Logged in successfully.")
+        except Exception as e:
+            print(f"Login failed: {e}")
+
+    def get_holidays_from_nager(self, year):
+        if year in self.HOLIDAYS_CACHE:
+            return self.HOLIDAYS_CACHE[year]
+        url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/PH"
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            dates = {item['date'] for item in data}
+            self.HOLIDAYS_CACHE[year] = dates
+            return dates
+        except Exception as e:
+            print(f"Nager API failed: {e}")
+            return set()
+
+    def get_holidays_from_gazette(self):
+        url = "https://www.officialgazette.gov.ph/nationwide-holidays/"
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            text = soup.get_text(" ", strip=True)
+            date_matches = re.findall(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", text)
+            parsed = set()
+            for d in date_matches:
+                try:
+                    parsed.add(datetime.strptime(d, "%B %d, %Y").date().isoformat())
+                except:
+                    continue
+            return parsed
+        except Exception as e:
+            print(f"Gazette fetch failed: {e}")
+            return set()
+
+    def get_combined_holidays(self, year):
+        nager = self.get_holidays_from_nager(year)
+        gazette = self.get_holidays_from_gazette()
+        return nager.union(gazette)
+
+    def click_element_in_iframes(self, element_id):
+        driver = self.driver
+        wait = WebDriverWait(driver, 15)
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        for frame in frames:
+            driver.switch_to.frame(frame)
+            try:
+                btn = wait.until(EC.element_to_be_clickable((By.ID, element_id)))
+                btn.click()
+                driver.switch_to.default_content()
+                return True
+            except:
+                driver.switch_to.default_content()
+                continue
+        return False
+
+    def click_my_time_reports(self):
+        print("Clicking 'My Time Reports'...")
+        wait = WebDriverWait(self.driver, 20)
         my_time_reports = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//*[text()='My Time Reports']"))
         )
         my_time_reports.click()
-        print("Clicked 'My Time Reports' successfully!")
-    except Exception as e:
-        print(f"Could not click 'My Time Reports': {e}")
-        with open("page_snapshot_my_time.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
 
-def click_add(driver):
-    print("Looking for 'Add' button in iframes...")
-    wait = WebDriverWait(driver, 20)
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    print(f"Found {len(frames)} iframes. Searching each for Add button...")
+    def click_add(self):
+        print("Clicking 'Add' button...")
+        if not self.click_element_in_iframes("PTS_CFG_CL_WRK_PTS_ADD_BTN"):
+            print("Could not find Add button.")
 
-    add_clicked = False
-    for frame in frames:
-        driver.switch_to.frame(frame)
-        try:
-            add_button = wait.until(
-                EC.element_to_be_clickable((By.ID, "PTS_CFG_CL_WRK_PTS_ADD_BTN"))
-            )
-            add_button.click()
-            print("Clicked 'Add' button successfully!")
-            add_clicked = True
-            driver.switch_to.default_content()
-            break
-        except:
-            driver.switch_to.default_content()
-            continue
+    def click_open_blank_timesheet(self):
+        print("Clicking 'Open Blank Time Report'...")
+        if not self.click_element_in_iframes("EX_ICLIENT_WRK_OK_PB"):
+            print("Could not find 'Open Blank Time Report' button.")
 
-    if not add_clicked:
-        print("Could not find 'Add' button in any iframe.")
-        with open("page_snapshot_add.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
 
-def click_open_blank_timesheet(driver):
-    print("Looking for 'Open a Blank Time Report' button in iframes...")
-    wait = WebDriverWait(driver, 20)
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    print(f"Found {len(frames)} iframes. Searching each for Open a Blank Time Report button...")
+    def fill_training_hours(self):
+        driver = self.driver
+        wait = WebDriverWait(driver, 20)
+        driver.switch_to.default_content()
 
-    open_clicked = False
-    for frame in frames:
-        driver.switch_to.frame(frame)
-        try:
-            open_button = wait.until(
-                EC.element_to_be_clickable((By.ID, "EX_ICLIENT_WRK_OK_PB"))
-            )
-            open_button.click()
-            print("Clicked 'Open a Blank Time Report' button successfully!")
-            open_clicked = True
-            driver.switch_to.default_content()
-            break
-        except:
-            driver.switch_to.default_content()
-            continue
-
-    if not open_clicked:
-        print("Could not find 'Open a Blank Time Report' button in any iframe.")
-        with open("page_snapshot_add.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-
-def fill_training_hours(driver):
-    print("Searching for 'Training' row in all iframes...")
-    wait = WebDriverWait(driver, 20)
-    driver.switch_to.default_content()
-
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    print(f"Found {len(frames)} iframes. Searching for Training inputs...")
-
-    success = False
-    for frame in frames:
-        driver.switch_to.frame(frame)
-        try:
-            test_input = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.ID, "POL_TIME2$1"))
-            )
-            print("Found Training input field in this iframe.")
-            success = try_fill_training_inputs(driver, wait)
-            driver.switch_to.default_content()
-            break
-        except:
-            driver.switch_to.default_content()
-            continue
-
-    if not success:
-        print("Could not find Training row in any iframe.")
-        with open("page_snapshot_training.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-
-def try_fill_training_inputs(driver, wait):
-    try:
-        input_ids = ["POL_TIME2$1", "POL_TIME3$1", "POL_TIME4$1", "POL_TIME5$1", "POL_TIME6$1"]
-        public_holidays_ids = ["POL_TIME2$16", "POL_TIME3$16", "POL_TIME4$16", "POL_TIME5$16", "POL_TIME6$16"]
-        vacation_leaves_ids = ["POL_TIME2$17", "POL_TIME3$17", "POL_TIME4$17", "POL_TIME5$17", "POL_TIME6$17"]
-        sick_leaves_ids = ["POL_TIME2$18", "POL_TIME3$18", "POL_TIME4$18", "POL_TIME5$18", "POL_TIME6$18"]
-        exam_study_leaves_ids = ["POL_TIME2$20", "POL_TIME3$20", "POL_TIME4$20", "POL_TIME5$20", "POL_TIME6$20"]
-        bereavement_leaves_ids = ["POL_TIME2$21", "POL_TIME3$21", "POL_TIME4$21", "POL_TIME5$21", "POL_TIME6$21"]
-        legal_reasons_leaves_ids = ["POL_TIME2$22", "POL_TIME3$22", "POL_TIME4$22", "POL_TIME5$22", "POL_TIME6$22"]
-        marriage_leaves_ids = ["POL_TIME2$23", "POL_TIME3$23", "POL_TIME4$23", "POL_TIME5$23", "POL_TIME6$23"]
-        paternity_leaves_ids = ["POL_TIME2$24", "POL_TIME3$24", "POL_TIME4$24", "POL_TIME5$24", "POL_TIME6$24"]
-        administrative_leaves_ids = ["POL_TIME2$25", "POL_TIME3$25", "POL_TIME4$25", "POL_TIME5$25", "POL_TIME6$25"]
-        unpaid_leaves_ids = ["POL_TIME2$26", "POL_TIME3$26", "POL_TIME4$26", "POL_TIME5$26", "POL_TIME6$26"]
-        carer_leaves_ids = ["POL_TIME2$27", "POL_TIME3$27", "POL_TIME4$27", "POL_TIME5$27", "POL_TIME6$27"]
-        family_member_leaves_ids = ["POL_TIME2$28", "POL_TIME3$28", "POL_TIME4$28", "POL_TIME5$28", "POL_TIME6$28"]
-        paid_parental_leaves_ids = ["POL_TIME2$29", "POL_TIME3$29", "POL_TIME4$29", "POL_TIME5$29", "POL_TIME6$29"]
-
-        for i in range(len(input_ids)):
-            leave_filled = False
-            public_holiday_box = wait.until(EC.presence_of_element_located((By.ID, public_holidays_ids[i])))
-            if public_holiday_box.get_attribute("value").strip():
-                leave_filled = True
-
-            vacation_box = wait.until(EC.presence_of_element_located((By.ID, vacation_leaves_ids[i])))
-            if vacation_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            sick_box = wait.until(EC.presence_of_element_located((By.ID, sick_leaves_ids[i])))
-            if sick_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            exam_study_box = wait.until(EC.presence_of_element_located((By.ID, exam_study_leaves_ids[i])))
-            if exam_study_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            bereavement_leave_box = wait.until(EC.presence_of_element_located((By.ID, bereavement_leaves_ids[i])))
-            if bereavement_leave_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            legal_reasons_box = wait.until(EC.presence_of_element_located((By.ID, legal_reasons_leaves_ids[i])))
-            if legal_reasons_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            marriage_box = wait.until(EC.presence_of_element_located((By.ID, marriage_leaves_ids[i])))
-            if marriage_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            paternity_box = wait.until(EC.presence_of_element_located((By.ID, paternity_leaves_ids[i])))
-            if paternity_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            administrative_box = wait.until(EC.presence_of_element_located((By.ID, administrative_leaves_ids[i])))
-            if administrative_box.get_attribute("value").strip():   
-                leave_filled = True
-            
-            unpaid_box = wait.until(EC.presence_of_element_located((By.ID, unpaid_leaves_ids[i])))
-            if unpaid_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            carer_box = wait.until(EC.presence_of_element_located((By.ID, carer_leaves_ids[i])))
-            if carer_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            family_member_box = wait.until(EC.presence_of_element_located((By.ID, family_member_leaves_ids[i])))
-            if family_member_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            paid_parental_box = wait.until(EC.presence_of_element_located((By.ID, paid_parental_leaves_ids[i])))
-            if paid_parental_box.get_attribute("value").strip():
-                leave_filled = True
-            
-            if leave_filled:
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        target_frame = None
+        for frame in frames:
+            driver.switch_to.frame(frame)
+            try:
+                if driver.find_elements(By.ID, "POL_TIME2$1"):
+                    target_frame = frame
+                    driver.switch_to.default_content()
+                    break
+            except:
+                driver.switch_to.default_content()
                 continue
 
-            input_box = wait.until(EC.presence_of_element_located((By.ID, input_ids[i])))
-            input_box.clear()
-            input_box.send_keys("8")
-            print(f"Filled 8 hours for input ID: {input_ids[i]}")
-        
+        if not target_frame:
+            print("Could not find Training iframe.")
+            return False
+
+        wait.until(EC.frame_to_be_available_and_switch_to_it(target_frame))
+        today = datetime.now().date()
+        start_of_week = today - timedelta(days=today.weekday())
+        holidays = self.get_combined_holidays(today.year)
+
+        training_ids = [f"POL_TIME{2+i}$1" for i in range(5)]
+        holiday_ids = [f"POL_TIME{2+i}$16" for i in range(5)]
+        leave_groups = [
+            [f"POL_TIME{2+i}${j}" for i in range(5)]
+            for j in range(17, 30)
+        ]
+
+        for i in range(5):
+            current_day = start_of_week + timedelta(days=i)
+            current_iso = current_day.isoformat()
+
+            # skip weekends
+            if current_day.weekday() >= 5:
+                continue
+
+            # check leave
+            leave_found = False
+            for leave_ids in leave_groups:
+                try:
+                    el = driver.find_element(By.ID, leave_ids[i])
+                    if el.get_attribute("value").strip():
+                        leave_found = True
+                        print(f"{current_day}: Leave detected, skipping.")
+                        break
+                except:
+                    continue
+
+            if leave_found:
+                continue
+
+            # fill depending on holiday
+            try:
+                if current_iso in holidays:
+                    el = wait.until(EC.presence_of_element_located((By.ID, holiday_ids[i])))
+                    el.clear()
+                    el.send_keys("8")
+                    print(f"{current_day}: Public holiday — filled 8 on {holiday_ids[i]}")
+                else:
+                    el = wait.until(EC.presence_of_element_located((By.ID, training_ids[i])))
+                    el.clear()
+                    el.send_keys("8")
+                    print(f"{current_day}: Workday — filled 8 on {training_ids[i]}")
+            except Exception as e:
+                print(f"Could not fill for {current_day}: {e}")
+
+        driver.switch_to.default_content()
         return True
-    except Exception as e:
-        print(f"Error filling training inputs: {e}")
-        return False
 
-def refresh_page_clicked(driver):
-    print("Looking for 'Refresh' button in iframes...")
-    wait = WebDriverWait(driver, 20)
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    print(f"Found {len(frames)} iframes. Searching each for Refresh button...")
 
-    refresh_page_clicked = False
-    for frame in frames:
-        driver.switch_to.frame(frame)
+    def refresh_page(self):
+        print("Clicking 'Refresh' button...")
+        self.click_element_in_iframes("UC_EX_WRK_REFRESH")
+
+    def submit_timesheet(self):
+        print("Submitting timesheet...")
+        self.click_element_in_iframes("EX_TIME_HDR_WRK_PB_SUBMIT")
+
+    def confirm_ok(self):
+        print("Confirming OK...")
+        self.click_element_in_iframes("#ICSave")
+
+
+    def send_email(self, subject, body):
         try:
-            refresh_page_clicked = wait.until(
-                EC.element_to_be_clickable((By.ID, "UC_EX_WRK_REFRESH"))
-            )
-            refresh_page_clicked.click()
-            print("Clicked 'Refresh' button successfully!")
-            refresh_page_clicked = True
-            driver.switch_to.default_content()
-            break
-        except:
-            driver.switch_to.default_content()
-            continue
+            msg = MIMEMultipart()
+            msg["From"] = self.SENDER_EMAIL
+            msg["To"] = self.RECEIVER_EMAIL
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
 
-    if not refresh_page_clicked:
-        print("Could not find 'Refresh' button in any iframe.")
-        with open("page_snapshot_add.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
+            with smtplib.SMTP(self.SMTP_SERVER, self.SMTP_PORT) as server:
+                server.starttls()
+                server.login(self.SENDER_EMAIL, self.SENDER_PASSWORD)
+                server.send_message(msg)
+            print(f"Email sent successfully to {self.RECEIVER_EMAIL}")
+        except Exception as e:
+            print(f"Failed to send email: {e}")
 
-def submit_time_sheet(driver):
-    print("Looking for 'Submit' button in iframes...")
-    wait = WebDriverWait(driver, 20)
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    print(f"Found {len(frames)} iframes. Searching each for Submit button...")
-
-    submit_time_sheet = False
-    for frame in frames:
-        driver.switch_to.frame(frame)
+    def run(self):
         try:
-            submit_time_sheet = wait.until(
-                EC.element_to_be_clickable((By.ID, "EX_TIME_HDR_WRK_PB_SUBMIT"))
+            self.launch_edge()
+            self.login()
+            time.sleep(5)
+            self.click_my_time_reports()
+            time.sleep(1)
+            self.click_add()
+            time.sleep(1)
+            self.click_open_blank_timesheet()
+            time.sleep(2)
+            self.fill_training_hours()
+            time.sleep(3)
+            self.refresh_page()
+            time.sleep(3)
+            self.submit_timesheet()
+            time.sleep(30)
+            self.confirm_ok()
+            time.sleep(5)
+            print("Timesheet auto-filled successfully!")
+            self.send_email(
+                "Timesheet Automation Successful",
+                "Your timesheet has been successfully submitted for this week."
             )
-            submit_time_sheet.click()
-            print("Clicked 'Open a Blank Time Report' button successfully!")
-            submit_time_sheet = True
-            driver.switch_to.default_content()
-            break
-        except:
-            driver.switch_to.default_content()
-            continue
+        except Exception:
+            error_msg = traceback.format_exc()
+            print(error_msg)
+            self.send_email("Timesheet Auto-Fill Failed", error_msg)
+        finally:
+            print("Closing browser.")
+            if self.driver:
+                self.driver.quit()
 
-    if not submit_time_sheet:
-        print("Could not find 'Submit' button in any iframe.")
-        with open("page_snapshot_add.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-
-def main():
-    driver = launch_edge()
-    login(driver)
-    time.sleep(5)
-    click_my_time_reports(driver)
-    time.sleep(1)
-    click_add(driver)
-    time.sleep(1)
-    click_open_blank_timesheet(driver)
-    time.sleep(2)
-    fill_training_hours(driver)
-    time.sleep(3)
-    refresh_page_clicked(driver)
-    time.sleep(3)
-    submit_time_sheet(driver)
-    time.sleep(30)
-    print("Please review or add first the other details you need(eg. hazard pay, OT).")
-    time.sleep(60)
-    print("Script finished. Browser remains open for inspection.")
-    driver.quit()
 
 if __name__ == "__main__":
-    main()
+    bot = TimesheetBot()
+    bot.run()
 
